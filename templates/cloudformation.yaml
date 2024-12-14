@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Resources:
+  ExchangeRatesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: "ExchangeRatesTable"
+      AttributeDefinitions:
+        - AttributeName: "date"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "date"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+
+  FetchRatesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: fetch_rates.fetch_and_store
+      Runtime: python3.9
+      Code:
+        S3Bucket: "samaritan-lambda-deployment-artifact"
+        S3Key: "fetch_rates.zip"
+      Environment:
+        Variables:
+          TABLE_NAME: "ExchangeRatesTable"
+      Role: !GetAtt FetchRatesRole.Arn
+
+  APIHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: api_handler.get_current_rates
+      Runtime: python3.9
+      Code:
+        S3Bucket: "samaritan-lambda-deployment-artifact"
+        S3Key: "api_handler.zip"
+      Environment:
+        Variables:
+          TABLE_NAME: "ExchangeRatesTable"
+      Role: !GetAtt APIHandlerRole.Arn
+
+  DifferenceHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: api_handler.get_rate_differences
+      Runtime: python3.9
+      Code:
+        S3Bucket: "samaritan-lambda-deployment-artifact"
+        S3Key: "api_handler.zip"
+      Environment:
+        Variables:
+          TABLE_NAME: "ExchangeRatesTable"
+      Role: !GetAtt APIHandlerRole.Arn
+
+  FetchRatesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "DynamoDBAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt ExchangeRatesTable.Arn
+
+  APIHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "DynamoDBAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource: !GetAtt ExchangeRatesTable.Arn
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: "ExchangeRatesAPI"
+
+  ApiGatewayResourceRates:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "rates"
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayResourceDifference:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "difference"
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayResourceFetchUpdate:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "fetch_update"
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayMethodGetRates:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: "GET"
+      ResourceId: !Ref ApiGatewayResourceRates
+      RestApiId: !Ref ApiGateway
+      AuthorizationType: "NONE"
+      Integration:
+        Type: "AWS_PROXY"
+        IntegrationHttpMethod: "POST"
+        Uri: !Sub
+          "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIHandlerFunction.Arn}/invocations"
+
+  ApiGatewayMethodGetDifference:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: "GET"
+      ResourceId: !Ref ApiGatewayResourceDifference
+      RestApiId: !Ref ApiGateway
+      AuthorizationType: "NONE"
+      Integration:
+        Type: "AWS_PROXY"
+        IntegrationHttpMethod: "POST"
+        Uri: !Sub
+          "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DifferenceHandlerFunction.Arn}/invocations"
+
+  ApiGatewayMethodFetchUpdate:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: "GET"
+      ResourceId: !Ref ApiGatewayResourceFetchUpdate
+      RestApiId: !Ref ApiGateway
+      AuthorizationType: "NONE"
+      Integration:
+        Type: "AWS_PROXY"
+        IntegrationHttpMethod: "POST"
+        Uri: !Sub
+          "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FetchRatesFunction.Arn}/invocations"
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayMethodGetRates
+      - ApiGatewayMethodGetDifference
+      - ApiGatewayMethodFetchUpdate
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: "prod"
+
+  ApiGatewayLambdaPermissionsFetchUpdate:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FetchRatesFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/GET/fetch_update"
+
+  ApiGatewayLambdaPermissionsGetRates:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref APIHandlerFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/GET/rates"
+
+  ApiGatewayLambdaPermissionsDifferenceHandler:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DifferenceHandlerFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/GET/difference"
+
+  FetchRatesSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: "rate(24 hours)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt FetchRatesFunction.Arn
+          Id: "FetchRatesTarget"
+
+  FetchRatesPermissionForEvents:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FetchRatesFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt FetchRatesSchedule.Arn
+
